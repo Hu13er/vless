@@ -1,10 +1,40 @@
 import json
+import ipaddress
 import os
+import socket
 from urllib.parse import parse_qs, unquote, urlparse
 
 
 DEFAULT_DNS_REMOTE = "1.1.1.1"
-DEFAULT_DNS_DIRECT = "1.1.1.1"
+DEFAULT_TUN_ADDRESS = "198.18.0.1/30"
+
+
+def is_ip_address(value):
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
+def resolve_server_ip(server, port):
+    if not server or is_ip_address(server):
+        return server
+
+    ipv4_candidates = []
+    fallback_candidates = []
+    for family, _, _, _, sockaddr in socket.getaddrinfo(server, port, type=socket.SOCK_STREAM):
+        ip = sockaddr[0]
+        if family == socket.AF_INET and ip not in ipv4_candidates:
+            ipv4_candidates.append(ip)
+        elif ip not in fallback_candidates:
+            fallback_candidates.append(ip)
+
+    if ipv4_candidates:
+        return ipv4_candidates[0]
+    if fallback_candidates:
+        return fallback_candidates[0]
+    return server
 
 
 def ensure_runtime_defaults(config, proxy_tag="proxy"):
@@ -26,11 +56,16 @@ def ensure_runtime_defaults(config, proxy_tag="proxy"):
         config["dns"] = {
             "servers": [
                 {
-                    "type": "udp",
+                    "type": "https",
                     "tag": "dns-remote",
                     "server": DEFAULT_DNS_REMOTE,
-                    "server_port": 53,
+                    "server_port": 443,
+                    "path": "/dns-query",
                     "detour": proxy_tag,
+                    "tls": {
+                        "enabled": True,
+                        "server_name": "cloudflare-dns.com",
+                    },
                 },
                 {
                     "type": "local",
@@ -44,6 +79,26 @@ def ensure_runtime_defaults(config, proxy_tag="proxy"):
     route.setdefault("auto_detect_interface", True)
     route.setdefault("final", proxy_tag)
     route.setdefault("default_domain_resolver", "dns-direct")
+    route.setdefault(
+        "rules",
+        [
+            {
+                "network": "udp",
+                "port": 53,
+                "action": "hijack-dns",
+            },
+            {
+                "network": "tcp",
+                "port": 53,
+                "action": "hijack-dns",
+            },
+            {
+                "ip_is_private": True,
+                "action": "route",
+                "outbound": "direct",
+            },
+        ],
+    )
 
     return config
 
@@ -139,13 +194,19 @@ def vless_to_singbox(vless_url, enable_tun=True):
                 "tag": "tun-in",
                 "interface_name": "singtun0",
                 "address": [
-                    "172.19.0.1/30"
+                    DEFAULT_TUN_ADDRESS
                 ],
                 "auto_route": True,
                 "strict_route": True,
                 "stack": "system"
             }
         ]
+
+    resolved_server = resolve_server_ip(server, port)
+    if resolved_server != server:
+        config["outbounds"][0]["server"] = resolved_server
+        if "tls" in config["outbounds"][0]:
+            config["outbounds"][0]["tls"].setdefault("server_name", sni)
 
     return ensure_runtime_defaults(config)
 

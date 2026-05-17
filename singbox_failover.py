@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import ipaddress
 import json
 import os
 import signal
@@ -36,7 +37,7 @@ except ImportError:
 
 
 DEFAULT_DNS_REMOTE = "1.1.1.1"
-DEFAULT_DNS_DIRECT = "1.1.1.1"
+DEFAULT_TUN_ADDRESS = "198.18.0.1/30"
 TEST_URLS = (
     "https://cp.cloudflare.com/generate_204",
     "https://www.gstatic.com/generate_204",
@@ -111,6 +112,7 @@ class SingboxFailoverManager:
         self.active_temp_dir: Path | None = None
         self.monitor_port: int | None = None
         self.stop_requested = False
+        self.shutdown_announced = False
         self.fail_streak = 0
         self.started_at = time.time()
 
@@ -119,6 +121,10 @@ class SingboxFailoverManager:
         self.events.append(f"[{timestamp}] {message}")
         self.events = self.events[-10:]
         self.refresh_ui()
+
+    def stop_if_requested(self):
+        if self.stop_requested:
+            raise KeyboardInterrupt
 
     def refresh_ui(self):
         if self.console.enabled:
@@ -211,7 +217,37 @@ class SingboxFailoverManager:
         ok = 0 if node.status in {"active", "ready", "healthy"} else 1
         return (ok, node.last_score, node.name)
 
+    @staticmethod
+    def is_ip_address(value: str | None) -> bool:
+        if not value:
+            return False
+        try:
+            ipaddress.ip_address(value)
+            return True
+        except ValueError:
+            return False
+
+    def resolve_server_ip(self, server: str, port: int) -> str:
+        if self.is_ip_address(server):
+            return server
+
+        ipv4_candidates: list[str] = []
+        fallback_candidates: list[str] = []
+        for family, _, _, _, sockaddr in socket.getaddrinfo(server, port, type=socket.SOCK_STREAM):
+            ip = sockaddr[0]
+            if family == socket.AF_INET and ip not in ipv4_candidates:
+                ipv4_candidates.append(ip)
+            elif ip not in fallback_candidates:
+                fallback_candidates.append(ip)
+
+        if ipv4_candidates:
+            return ipv4_candidates[0]
+        if fallback_candidates:
+            return fallback_candidates[0]
+        return server
+
     def discover_nodes(self):
+        self.stop_if_requested()
         json_files = sorted(
             path for path in self.config_dir.glob("*.json") if not path.name.startswith("_tmp-")
         )
@@ -220,9 +256,19 @@ class SingboxFailoverManager:
 
         nodes: list[NodeState] = []
         for path in json_files:
+            self.stop_if_requested()
             config = json.loads(path.read_text())
             outbounds = config.get("outbounds", [])
-            proxy = next((item for item in outbounds if item.get("type") == "vless"), None)
+            if any(item.get("type") in {"selector", "urltest"} for item in outbounds):
+                self.log_event(f"Skipping {path.name}: aggregate config, not a raw node file")
+                continue
+
+            vless_outbounds = [item for item in outbounds if item.get("type") == "vless"]
+            if len(vless_outbounds) != 1:
+                self.log_event(f"Skipping {path.name}: expected exactly one VLESS outbound")
+                continue
+
+            proxy = vless_outbounds[0]
             if not proxy:
                 self.log_event(f"Skipping {path.name}: no VLESS outbound found")
                 continue
@@ -259,6 +305,14 @@ class SingboxFailoverManager:
         proxy_tag = proxy_outbound.get("tag") or "proxy"
         proxy_outbound["tag"] = proxy_tag
 
+        server = proxy_outbound.get("server")
+        server_port = int(proxy_outbound.get("server_port", 443))
+        tls = proxy_outbound.get("tls")
+        if tls and tls.get("enabled") and isinstance(server, str) and not self.is_ip_address(server):
+            tls.setdefault("server_name", server)
+        if include_tun and isinstance(server, str) and not self.is_ip_address(server):
+            proxy_outbound["server"] = self.resolve_server_ip(server, server_port)
+
         existing_tags = {
             item.get("tag")
             for item in outbounds
@@ -273,11 +327,16 @@ class SingboxFailoverManager:
             config["dns"] = {
                 "servers": [
                     {
-                        "type": "udp",
+                        "type": "https",
                         "tag": "dns-remote",
                         "server": DEFAULT_DNS_REMOTE,
-                        "server_port": 53,
+                        "server_port": 443,
+                        "path": "/dns-query",
                         "detour": proxy_tag,
+                        "tls": {
+                            "enabled": True,
+                            "server_name": "cloudflare-dns.com",
+                        },
                     },
                     {
                         "type": "local",
@@ -291,6 +350,26 @@ class SingboxFailoverManager:
         route.setdefault("auto_detect_interface", include_tun)
         route.setdefault("final", proxy_tag)
         route.setdefault("default_domain_resolver", "dns-direct")
+        route.setdefault(
+            "rules",
+            [
+                {
+                    "network": "udp",
+                    "port": 53,
+                    "action": "hijack-dns",
+                },
+                {
+                    "network": "tcp",
+                    "port": 53,
+                    "action": "hijack-dns",
+                },
+                {
+                    "ip_is_private": True,
+                    "action": "route",
+                    "outbound": "direct",
+                },
+            ],
+        )
 
         inbounds = list(config.get("inbounds", []))
         if include_tun:
@@ -301,7 +380,7 @@ class SingboxFailoverManager:
                         "type": "tun",
                         "tag": "tun-in",
                         "interface_name": "singtun0",
-                        "address": ["172.19.0.1/30"],
+                        "address": [DEFAULT_TUN_ADDRESS],
                         "auto_route": True,
                         "strict_route": True,
                         "stack": "system",
@@ -360,6 +439,7 @@ class SingboxFailoverManager:
     def wait_for_start(self, process: subprocess.Popen, port: int, timeout: float, log_path: Path):
         deadline = time.time() + timeout
         while time.time() < deadline:
+            self.stop_if_requested()
             if process.poll() is not None:
                 raise RuntimeError(self.tail_text(log_path) or "sing-box exited early")
 
@@ -374,6 +454,7 @@ class SingboxFailoverManager:
         raise RuntimeError(self.tail_text(log_path) or "timed out waiting for sing-box to listen")
 
     def fetch_via_proxy(self, port: int, url: str, timeout: float):
+        self.stop_if_requested()
         proxy = f"http://127.0.0.1:{port}"
         opener = urllib.request.build_opener(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy})
@@ -399,6 +480,7 @@ class SingboxFailoverManager:
         return None
 
     def probe_node(self, node: NodeState):
+        self.stop_if_requested()
         port = self.reserve_port()
         temp_dir, config_path, log_path = self.write_runtime_config(
             node, include_tun=False, mixed_port=port
@@ -426,6 +508,7 @@ class SingboxFailoverManager:
             last_error = None
 
             for url in TEST_URLS:
+                self.stop_if_requested()
                 try:
                     latency_ms, body = self.fetch_via_proxy(port, url, self.args.probe_timeout)
                     measurements.append(latency_ms)
@@ -450,6 +533,9 @@ class SingboxFailoverManager:
         except subprocess.CalledProcessError as exc:
             stderr = (exc.stderr or "").strip()
             node.last_error = stderr or exc.stdout.strip() or "sing-box check failed"
+        except KeyboardInterrupt:
+            node.last_error = "interrupted by user"
+            raise
         except Exception as exc:  # noqa: BLE001
             node.last_error = str(exc)
         finally:
@@ -474,6 +560,7 @@ class SingboxFailoverManager:
     def benchmark_nodes(self):
         self.log_event("Benchmarking all nodes...")
         for node in self.nodes:
+            self.stop_if_requested()
             self.probe_node(node)
 
     def pick_best_node(self) -> NodeState | None:
@@ -483,6 +570,7 @@ class SingboxFailoverManager:
         return min(candidates, key=lambda item: item.latency_ms or float("inf"))
 
     def activate_node(self, node: NodeState):
+        self.stop_if_requested()
         if not self.args.proxy_only and os.geteuid() != 0:
             raise RuntimeError("TUN mode needs root privileges. Re-run with sudo or use --proxy-only.")
 
@@ -534,10 +622,12 @@ class SingboxFailoverManager:
         self.active_temp_dir = None
 
     def health_check_active(self):
+        self.stop_if_requested()
         if not self.active_node or not self.monitor_port:
             raise RuntimeError("No active node")
         last_error = None
         for url in TEST_URLS:
+            self.stop_if_requested()
             try:
                 latency_ms, body = self.fetch_via_proxy(self.monitor_port, url, self.args.probe_timeout)
                 self.active_node.latency_ms = latency_ms
@@ -565,6 +655,7 @@ class SingboxFailoverManager:
         self.failover()
 
     def failover(self):
+        self.stop_if_requested()
         failed = self.active_node
         if failed:
             failed.status = "down"
@@ -579,7 +670,9 @@ class SingboxFailoverManager:
 
     def handle_signal(self, signum, _frame):
         self.stop_requested = True
-        self.log_event(f"Received signal {signum}, shutting down...")
+        if not self.shutdown_announced:
+            self.shutdown_announced = True
+            print(f"\nReceived signal {signum}, shutting down...", flush=True)
 
     def run(self):
         signal.signal(signal.SIGINT, self.handle_signal)
@@ -588,6 +681,7 @@ class SingboxFailoverManager:
         try:
             self.discover_nodes()
             self.benchmark_nodes()
+            self.stop_if_requested()
             best = self.pick_best_node()
             if not best:
                 raise RuntimeError("None of the VLESS configs passed the connectivity tests.")
@@ -611,6 +705,8 @@ class SingboxFailoverManager:
                 self.health_check_active()
 
             return 0
+        except KeyboardInterrupt:
+            return 130
         finally:
             self.deactivate_current()
             self.console.stop()
