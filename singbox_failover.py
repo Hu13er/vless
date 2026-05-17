@@ -479,6 +479,27 @@ class SingboxFailoverManager:
                 return line.split("=", 1)[1].strip()
         return None
 
+    def measure_connection(self, port: int, sample_goal: int):
+        measurements: list[float] = []
+        public_ip = None
+        last_error = None
+
+        for url in TEST_URLS:
+            self.stop_if_requested()
+            try:
+                latency_ms, body = self.fetch_via_proxy(port, url, self.args.probe_timeout)
+                measurements.append(latency_ms)
+                public_ip = public_ip or self.extract_public_ip(body)
+                if len(measurements) >= sample_goal:
+                    break
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_error = str(exc)
+
+        if not measurements:
+            return None, public_ip, last_error or "all health checks failed"
+
+        return sum(measurements) / len(measurements), public_ip, None
+
     def probe_node(self, node: NodeState):
         self.stop_if_requested()
         port = self.reserve_port()
@@ -503,25 +524,11 @@ class SingboxFailoverManager:
             process, handle = self.spawn_singbox(config_path, log_path)
             self.wait_for_start(process, port, self.args.start_timeout, log_path)
 
-            measurements: list[float] = []
-            public_ip = None
-            last_error = None
+            latency_ms, public_ip, error = self.measure_connection(port, self.args.samples)
+            if latency_ms is None:
+                raise RuntimeError(error or self.tail_text(log_path) or "all health checks failed")
 
-            for url in TEST_URLS:
-                self.stop_if_requested()
-                try:
-                    latency_ms, body = self.fetch_via_proxy(port, url, self.args.probe_timeout)
-                    measurements.append(latency_ms)
-                    public_ip = public_ip or self.extract_public_ip(body)
-                    if len(measurements) >= self.args.samples:
-                        break
-                except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                    last_error = str(exc)
-
-            if not measurements:
-                raise RuntimeError(last_error or self.tail_text(log_path) or "all health checks failed")
-
-            node.latency_ms = sum(measurements) / len(measurements)
+            node.latency_ms = latency_ms
             node.public_ip = public_ip
             node.last_error = None
             node.last_checked_at = time.time()
@@ -562,6 +569,17 @@ class SingboxFailoverManager:
         for node in self.nodes:
             self.stop_if_requested()
             self.probe_node(node)
+
+    def ordered_candidates(self, exclude: set[str] | None = None):
+        excluded = exclude or set()
+        return sorted(
+            [node for node in self.nodes if node.name not in excluded],
+            key=lambda item: (
+                0 if item.last_score != float("inf") else 1,
+                item.last_score,
+                item.name,
+            ),
+        )
 
     def pick_best_node(self) -> NodeState | None:
         candidates = [node for node in self.nodes if node.latency_ms is not None and node.status != "down"]
@@ -607,6 +625,53 @@ class SingboxFailoverManager:
         node.status = "active"
         self.log_event(f"Activated {node.name} on local monitor port {port}")
 
+    def validate_active_node(self):
+        self.stop_if_requested()
+        if not self.active_node or not self.monitor_port:
+            raise RuntimeError("No active node")
+
+        latency_ms, public_ip, error = self.measure_connection(self.monitor_port, 1)
+        if latency_ms is None:
+            self.active_node.failure_count += 1
+            self.active_node.last_error = error or self.tail_text(self.active_log_path)
+            self.active_node.last_checked_at = time.time()
+            self.active_node.last_score = float("inf")
+            self.active_node.status = "down"
+            self.log_event(f"Activation test failed for {self.active_node.name}: {self.active_node.last_error}")
+            return False
+
+        self.active_node.latency_ms = latency_ms
+        self.active_node.public_ip = self.active_node.public_ip or public_ip
+        self.active_node.last_error = None
+        self.active_node.last_checked_at = time.time()
+        self.active_node.last_score = latency_ms
+        self.active_node.status = "healthy"
+        self.fail_streak = 0
+        self.refresh_ui()
+        return True
+
+    def connect_first_available(self, exclude: set[str] | None = None):
+        excluded = exclude or set()
+        for node in self.ordered_candidates(excluded):
+            self.stop_if_requested()
+            try:
+                self.activate_node(node)
+            except Exception as exc:  # noqa: BLE001
+                node.failure_count += 1
+                node.last_error = str(exc)
+                node.last_checked_at = time.time()
+                node.last_score = float("inf")
+                node.status = "down"
+                self.log_event(f"Failed to activate {node.name}: {node.last_error}")
+                continue
+
+            if self.validate_active_node():
+                return node
+
+            self.deactivate_current()
+
+        return None
+
     def deactivate_current(self):
         self.stop_process(self.active_proc)
         if self.active_log_handle:
@@ -625,26 +690,21 @@ class SingboxFailoverManager:
         self.stop_if_requested()
         if not self.active_node or not self.monitor_port:
             raise RuntimeError("No active node")
-        last_error = None
-        for url in TEST_URLS:
-            self.stop_if_requested()
-            try:
-                latency_ms, body = self.fetch_via_proxy(self.monitor_port, url, self.args.probe_timeout)
-                self.active_node.latency_ms = latency_ms
-                self.active_node.public_ip = self.active_node.public_ip or self.extract_public_ip(body)
-                self.active_node.last_error = None
-                self.active_node.last_checked_at = time.time()
-                self.active_node.last_score = latency_ms
-                self.active_node.status = "healthy"
-                self.fail_streak = 0
-                self.refresh_ui()
-                return
-            except (urllib.error.URLError, TimeoutError, OSError) as exc:
-                last_error = str(exc)
+        latency_ms, public_ip, error = self.measure_connection(self.monitor_port, 1)
+        if latency_ms is not None:
+            self.active_node.latency_ms = latency_ms
+            self.active_node.public_ip = self.active_node.public_ip or public_ip
+            self.active_node.last_error = None
+            self.active_node.last_checked_at = time.time()
+            self.active_node.last_score = latency_ms
+            self.active_node.status = "healthy"
+            self.fail_streak = 0
+            self.refresh_ui()
+            return
 
         self.fail_streak += 1
         self.active_node.failure_count += 1
-        self.active_node.last_error = last_error or self.tail_text(self.active_log_path)
+        self.active_node.last_error = error or self.tail_text(self.active_log_path)
         self.active_node.status = "unstable"
         self.log_event(
             f"Health check failed for {self.active_node.name} "
@@ -657,16 +717,17 @@ class SingboxFailoverManager:
     def failover(self):
         self.stop_if_requested()
         failed = self.active_node
+        excluded: set[str] = set()
         if failed:
+            excluded.add(failed.name)
             failed.status = "down"
             failed.last_score = float("inf")
             self.log_event(f"Failing over away from {failed.name}")
         self.deactivate_current()
-        self.benchmark_nodes()
-        replacement = self.pick_best_node()
+        replacement = self.connect_first_available(excluded)
         if not replacement:
             raise RuntimeError("No working nodes remain after failover.")
-        self.activate_node(replacement)
+        self.log_event(f"Switched to {replacement.name}")
 
     def handle_signal(self, signum, _frame):
         self.stop_requested = True
@@ -680,17 +741,18 @@ class SingboxFailoverManager:
         self.console.start()
         try:
             self.discover_nodes()
-            self.benchmark_nodes()
-            self.stop_if_requested()
-            best = self.pick_best_node()
-            if not best:
-                raise RuntimeError("None of the VLESS configs passed the connectivity tests.")
-
             if self.args.check_only:
+                self.benchmark_nodes()
+                self.stop_if_requested()
+                best = self.pick_best_node()
+                if not best:
+                    raise RuntimeError("None of the VLESS configs passed the connectivity tests.")
                 self.log_event(f"Best node is {best.name} ({self.format_latency(best.latency_ms)})")
                 return 0
 
-            self.activate_node(best)
+            chosen = self.connect_first_available()
+            if not chosen:
+                raise RuntimeError("None of the VLESS configs could be activated.")
             self.log_event("Monitoring connectivity. Press Ctrl+C to stop.")
 
             while not self.stop_requested:
